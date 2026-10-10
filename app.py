@@ -3,6 +3,7 @@ Trading-Entscheidungsagent: Dow-Jones-Scanner als Web-App (Long)
 Keine Finanzberatung, keine Prognose. Nur Strukturierung von Signalen.
 """
 import io
+from pathlib import Path
 
 import pandas as pd
 import streamlit as st
@@ -14,7 +15,7 @@ DOW = ["AAPL", "AMGN", "AMZN", "AXP", "BA", "CAT", "CRM", "CSCO", "CVX", "DIS",
 
 SIGNALE = ["RSI schneidet MA", "Kerze schneidet EMA20", "EMA5 schneidet EMA20"]
 
-st.set_page_config(page_title="Dow Scanner", layout="centered")
+st.set_page_config(page_title="Dow Scanner", page_icon=str(Path(__file__).parent / "icon.png"), layout="centered")
 
 
 def rsi(close, n=14):
