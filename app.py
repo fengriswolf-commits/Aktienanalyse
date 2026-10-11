@@ -45,6 +45,8 @@ WIKI = {
     "Nasdaq-100": ("https://en.wikipedia.org/wiki/Nasdaq-100", "Ticker", "Company"),
 }
 DE_WIKI = {"MDAX": "https://de.wikipedia.org/wiki/MDAX", "SDAX": "https://de.wikipedia.org/wiki/SDAX"}
+INDIZES = {"Dow Jones": "^DJI", "DAX": "^GDAXI", "MDAX": "^MDAXI", "SDAX": "^SDAXI",
+           "S&P 500": "^GSPC", "Nasdaq-100": "^NDX"}
 MARKT_NAMEN = ["Dow Jones", "DAX", "MDAX", "SDAX", "S&P 500", "Nasdaq-100"]
 SIGNALE = ["RSI schneidet MA", "Kerze schneidet EMA20", "EMA5 schneidet EMA20"]
 ANZEIGE = ["Name", "Ticker", "Kurs", "Abstand EMA200 %", "Signale"]
@@ -216,6 +218,47 @@ def zeige_chart(z, tage, markt):
     st.plotly_chart(fig, width="stretch", config={"displayModeBar": False})
 
 
+@st.cache_resource(ttl=3600, show_spinner=False)
+def lade_indizes():
+    roh = yf.download(list(INDIZES.values()), period="2y", interval="1d", auto_adjust=True,
+                      group_by="ticker", threads=True, progress=False)
+    out = {}
+    for name, t in INDIZES.items():
+        try:
+            c = roh[t]["Close"].dropna()
+        except Exception:
+            continue
+        if len(c) >= 220:
+            out[name] = c
+    return out
+
+
+def zeige_indizes():
+    with st.spinner("Lade Indizes ..."):
+        idx = lade_indizes()
+    if not idx:
+        st.warning("Keine Indexdaten geladen. Bitte später erneut versuchen.")
+        return
+    for name, c in idx.items():
+        ema = c.ewm(span=200, adjust=False).mean()
+        j = c.tail(252)
+        wandel = (j.iloc[-1] / j.iloc[0] - 1) * 100
+        lage = "über" if c.iloc[-1] > ema.iloc[-1] else "unter"
+        st.subheader(f"{name} Index")
+        st.metric("Stand", f"{j.iloc[-1]:,.0f}".replace(",", "."), f"{wandel:+.1f} % in 12 Monaten")
+        st.caption(f"Liegt {lage} der EMA200.")
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(x=j.index, y=j, name=name, mode="lines",
+                                 line=dict(color="#1f77b4", width=2)))
+        fig.add_trace(go.Scatter(x=j.index, y=ema.reindex(j.index), name="EMA200", mode="lines",
+                                 line=dict(color="#ff7f0e", width=1.4, dash="dot")))
+        fig.update_xaxes(rangebreaks=[dict(bounds=["sat", "mon"])], fixedrange=True)
+        fig.update_yaxes(fixedrange=True)
+        fig.update_layout(height=240, margin=dict(l=4, r=4, t=8, b=4), dragmode=False,
+                          legend=dict(orientation="h", y=1.18, x=0))
+        st.plotly_chart(fig, width="stretch", config={"displayModeBar": False}, key=f"idx_{name}")
+
+
 def bericht(z):
     aktiv = [k for k in SIGNALE if z[k]]
     n = len(aktiv)
@@ -249,13 +292,17 @@ st.caption("Long-Setups über EMA200. Keine Finanzberatung, keine Prognose.")
 lookback = st.slider("Signal-Zeitraum (letzte Tage)", 1, 10, 3)
 min_signale = st.slider("Mindestanzahl Signale", 0, 3, 1)
 
-plaetze = st.columns(2) + st.columns(2) + st.columns(2)
 gewaehlt = None
+if st.button("Index", type="primary", width="stretch", key="btn_Index"):
+    gewaehlt = "Index"
+plaetze = st.columns(2) + st.columns(2) + st.columns(2)
 for platz, name in zip(plaetze, MARKT_NAMEN):
     if platz.button(f"{name} scannen", type="primary", width="stretch", key=f"btn_{name}"):
         gewaehlt = name
 
-if gewaehlt:
+if gewaehlt == "Index":
+    st.session_state["markt"] = "Index"
+elif gewaehlt:
     try:
         with st.spinner("Lade Aktienliste ... (beim ersten MDAX- oder SDAX-Scan dauert das etwa eine Minute)"):
             pakete = bloecke(gewaehlt)
@@ -271,6 +318,9 @@ if gewaehlt:
     st.session_state["scan_nr"] = st.session_state.get("scan_nr", 0) + 1
 
 markt = st.session_state.get("markt")
+if markt == "Index":
+    zeige_indizes()
+    markt = None
 if markt:
     rows = analysiere(markt, lookback)
     if not rows:
