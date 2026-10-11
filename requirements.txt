@@ -3,3 +3,5 @@ yfinance
 pandas
 openpyxl
 plotly
+requests
+lxml

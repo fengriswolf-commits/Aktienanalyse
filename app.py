@@ -1,17 +1,19 @@
 """
-Aktien-Scanner (Long): Dow Jones und DAX mit Chart bei Klick auf eine Aktie.
+Aktien-Scanner (Long): Dow Jones, DAX, S&P 500 und Nasdaq-100 mit Chart bei Klick auf eine Aktie.
 Keine Finanzberatung, keine Prognose. Nur Strukturierung von Signalen.
 """
 import io
+import re
 from pathlib import Path
 
 import pandas as pd
 import plotly.graph_objects as go
+import requests
 import streamlit as st
 import yfinance as yf
 from plotly.subplots import make_subplots
 
-MAERKTE = {
+STATISCH = {
     "Dow Jones": {
         "AAPL": "Apple", "AMGN": "Amgen", "AMZN": "Amazon", "AXP": "American Express",
         "BA": "Boeing", "CAT": "Caterpillar", "CRM": "Salesforce", "CSCO": "Cisco",
@@ -38,9 +40,16 @@ MAERKTE = {
         "VOW3.DE": "Volkswagen Vz.", "ZAL.DE": "Zalando",
     },
 }
+WIKI = {
+    "S&P 500": ("https://en.wikipedia.org/wiki/List_of_S%26P_500_companies", "Symbol", "Security"),
+    "Nasdaq-100": ("https://en.wikipedia.org/wiki/Nasdaq-100", "Ticker", "Company"),
+}
+DE_WIKI = {"MDAX": "https://de.wikipedia.org/wiki/MDAX", "SDAX": "https://de.wikipedia.org/wiki/SDAX"}
+MARKT_NAMEN = ["Dow Jones", "DAX", "MDAX", "SDAX", "S&P 500", "Nasdaq-100"]
 SIGNALE = ["RSI schneidet MA", "Kerze schneidet EMA20", "EMA5 schneidet EMA20"]
 ANZEIGE = ["Name", "Ticker", "Kurs", "Abstand EMA200 %", "Signale"]
 TAGE = {"3 Monate": 63, "6 Monate": 126, "1 Jahr": 252}
+BLOCK = 50  # Aktien pro Download-Paket
 
 st.set_page_config(page_title="Aktien-Scanner",
                    page_icon=str(Path(__file__).parent / "icon.png"),
@@ -59,14 +68,96 @@ def cross_up(a, b, n):
     return bool(((diff.shift(1) <= 0) & (diff > 0)).tail(n).any())
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
-def lade(ticker):
-    return yf.download(ticker, period="2y", interval="1d",
-                       auto_adjust=True, progress=False)
+NAMENSTEILE = {"ag", "se", "kgaa", "sa", "s.a.", "gmbh", "co.", "co", "&", "kg", "n.v.",
+               "plc", "holding", "stiftung", "group", "und", "vz.", "vz", "inc."}
+
+
+def loese_ticker(name):
+    """Sucht zum Firmennamen das Xetra-Kürzel (.DE) bei Yahoo."""
+    kern = " ".join(w for w in name.split() if w.lower().strip(",.") not in NAMENSTEILE) or name
+    erstes = kern.split()[0].lower()
+    try:
+        treffer = yf.Search(kern, max_results=8, news_count=0).quotes
+    except Exception:
+        return None
+    for q in treffer:
+        text = f"{q.get('longname', '')} {q.get('shortname', '')}".lower()
+        if str(q.get("symbol", "")).endswith(".DE") and erstes[:5] in text:
+            return q["symbol"]
+    return None
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def index_laden(markt):
+    """MDAX/SDAX: Namen von Wikipedia, Kürzel per Yahoo-Suche. Gibt (gefunden, nicht gefunden) zurück."""
+    r = requests.get(DE_WIKI[markt], headers={"User-Agent": "Mozilla/5.0 (aktien-scanner)"}, timeout=20)
+    r.raise_for_status()
+    namen = []
+    for t in pd.read_html(io.StringIO(r.text)):
+        spalte = next((c for c in ("Name", "Unternehmen") if c in t.columns), None)
+        if spalte and 40 <= len(t) <= 90:
+            namen = [re.sub(r"\[.*?\]", "", str(n)).strip() for n in t[spalte].dropna()]
+            break
+    if not namen:
+        raise ValueError("Tabelle nicht gefunden")
+    gefunden, fehlt = {}, []
+    for n in namen:
+        sym = loese_ticker(n)
+        if sym:
+            gefunden[sym] = n
+        else:
+            fehlt.append(n)
+    return gefunden, fehlt
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def liste(markt):
+    """Ticker -> Name. S&P 500 und Nasdaq-100 werden aktuell von Wikipedia gelesen."""
+    if markt in STATISCH:
+        return STATISCH[markt]
+    if markt in DE_WIKI:
+        return index_laden(markt)[0]
+    url, sym, nam = WIKI[markt]
+    r = requests.get(url, headers={"User-Agent": "Mozilla/5.0 (aktien-scanner)"}, timeout=20)
+    r.raise_for_status()
+    for t in pd.read_html(io.StringIO(r.text)):
+        if sym in t.columns and nam in t.columns:
+            t = t[[sym, nam]].dropna()
+            return {str(s).strip().replace(".", "-"): str(n).strip()
+                    for s, n in zip(t[sym], t[nam])}
+    raise ValueError("Tabelle nicht gefunden")
+
+
+@st.cache_resource(ttl=3600, show_spinner=False)
+def lade_block(tickers):
+    roh = yf.download(list(tickers), period="2y", interval="1d", auto_adjust=True,
+                      group_by="ticker", threads=True, progress=False)
+    out = {}
+    for t in tickers:
+        try:
+            d = roh[t] if isinstance(roh.columns, pd.MultiIndex) else roh
+            d = d[["Open", "High", "Low", "Close"]].dropna()
+        except Exception:
+            continue
+        if len(d) >= 220:
+            out[t] = d
+    return out
+
+
+def bloecke(markt):
+    ts = list(liste(markt))
+    return [tuple(ts[i:i + BLOCK]) for i in range(0, len(ts), BLOCK)]
+
+
+def daten(markt):
+    d = {}
+    for b in bloecke(markt):
+        d.update(lade_block(b))
+    return d
 
 
 def indikatoren(df):
-    c = df["Close"].squeeze()
+    c = df["Close"]
     r = rsi(c)
     return {"c": c, "ema5": c.ewm(span=5, adjust=False).mean(),
             "ema20": c.ewm(span=20, adjust=False).mean(),
@@ -74,10 +165,7 @@ def indikatoren(df):
             "r": r, "r_ma": r.rolling(14).mean()}
 
 
-def analyse(ticker, name, lookback):
-    df = lade(ticker)
-    if df.empty or len(df) < 220:
-        return None
+def analyse(ticker, name, df, lookback):
     i = indikatoren(df)
     c = i["c"]
     return {
@@ -93,8 +181,14 @@ def analyse(ticker, name, lookback):
     }
 
 
-def zeige_chart(z, tage):
-    df = lade(z["Ticker"])
+@st.cache_data(ttl=3600, show_spinner=False)
+def analysiere(markt, lookback):
+    d = daten(markt)
+    return [analyse(t, n, d[t], lookback) for t, n in liste(markt).items() if t in d]
+
+
+def zeige_chart(z, tage, markt):
+    df = daten(markt)[z["Ticker"]]
     i = indikatoren(df)
     d = df.tail(tage)
     x = d.index
@@ -102,8 +196,7 @@ def zeige_chart(z, tage):
     fig = make_subplots(rows=2, cols=1, shared_xaxes=True,
                         row_heights=[0.72, 0.28], vertical_spacing=0.04)
     fig.add_trace(go.Candlestick(
-        x=x, open=d["Open"].squeeze(), high=d["High"].squeeze(),
-        low=d["Low"].squeeze(), close=d["Close"].squeeze(),
+        x=x, open=d["Open"], high=d["High"], low=d["Low"], close=d["Close"],
         name="Kurs", showlegend=False), row=1, col=1)
     for k, name, farbe in (("ema5", "EMA5", "#7f7f7f"), ("ema20", "EMA20", "#1f77b4"),
                            ("ema200", "EMA200", "#ff7f0e")):
@@ -156,31 +249,35 @@ st.caption("Long-Setups über EMA200. Keine Finanzberatung, keine Prognose.")
 lookback = st.slider("Signal-Zeitraum (letzte Tage)", 1, 10, 3)
 min_signale = st.slider("Mindestanzahl Signale", 0, 3, 1)
 
-spalte1, spalte2 = st.columns(2)
+plaetze = st.columns(2) + st.columns(2) + st.columns(2)
 gewaehlt = None
-if spalte1.button("Dow Jones scannen", type="primary", width="stretch"):
-    gewaehlt = "Dow Jones"
-if spalte2.button("DAX scannen", type="primary", width="stretch"):
-    gewaehlt = "DAX"
+for platz, name in zip(plaetze, MARKT_NAMEN):
+    if platz.button(f"{name} scannen", type="primary", width="stretch", key=f"btn_{name}"):
+        gewaehlt = name
 
 if gewaehlt:
+    try:
+        with st.spinner("Lade Aktienliste ... (beim ersten MDAX- oder SDAX-Scan dauert das etwa eine Minute)"):
+            pakete = bloecke(gewaehlt)
+    except Exception:
+        st.error("Die Aktienliste konnte nicht geladen werden. Bitte später erneut versuchen.")
+        st.stop()
     balken = st.progress(0.0, text="Lade Kurse ...")
-    werte = MAERKTE[gewaehlt]
-    for n, t in enumerate(werte, 1):
-        lade(t)
-        balken.progress(n / len(werte), text=f"{t} ({n}/{len(werte)})")
+    for n, b in enumerate(pakete, 1):
+        lade_block(b)
+        balken.progress(n / len(pakete), text=f"Lade Kurse ... ({n}/{len(pakete)})")
     balken.empty()
     st.session_state["markt"] = gewaehlt
     st.session_state["scan_nr"] = st.session_state.get("scan_nr", 0) + 1
 
 markt = st.session_state.get("markt")
 if markt:
-    werte = MAERKTE[markt]
-    rows = [z for t, n in werte.items() if (z := analyse(t, n, lookback))]
+    rows = analysiere(markt, lookback)
     if not rows:
         st.warning("Keine Daten geladen. Bitte später erneut versuchen.")
         st.stop()
-    fehlt = [t for t in werte if t not in {z["Ticker"] for z in rows}]
+    gefunden = {z["Ticker"] for z in rows}
+    fehlt = [t for t in liste(markt) if t not in gefunden]
     tab = pd.DataFrame(rows)
     tab["Signale"] = tab[SIGNALE].sum(axis=1)
     treffer = tab[tab["Ueber EMA200"] & (tab["Signale"] >= min_signale)]
@@ -190,7 +287,10 @@ if markt:
     st.subheader(f"{markt}: {len(treffer)} Treffer "
                  f"({int(tab['Ueber EMA200'].sum())} von {len(tab)} über EMA200)")
     if fehlt:
-        st.caption("Keine Daten für: " + ", ".join(fehlt))
+        st.caption(f"Keine Daten für {len(fehlt)} Werte, zum Beispiel: " + ", ".join(fehlt[:8]))
+    if markt in DE_WIKI and index_laden(markt)[1]:
+        ohne = index_laden(markt)[1]
+        st.caption(f"Kein Yahoo-Kürzel gefunden für {len(ohne)} Werte, zum Beispiel: " + ", ".join(ohne[:6]))
     if treffer.empty:
         st.info("Keine Treffer. Setze die Mindestanzahl Signale herunter.")
         st.stop()
@@ -202,7 +302,8 @@ if markt:
 
     buf = io.BytesIO()
     treffer.to_excel(buf, index=False)
-    st.download_button("Als Excel speichern", buf.getvalue(), f"{markt}_scan.xlsx",
+    dateiname = markt.replace("&", "u").replace(" ", "_") + "_scan.xlsx"
+    st.download_button("Als Excel speichern", buf.getvalue(), dateiname,
                        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                        width="stretch")
 
@@ -211,5 +312,5 @@ if markt:
         z = treffer.iloc[zeilen[0]].to_dict()
         st.subheader(f"{z['Name']} ({z['Ticker']})")
         zeitraum = st.radio("Zeitraum", list(TAGE), index=1, horizontal=True)
-        zeige_chart(z, TAGE[zeitraum])
+        zeige_chart(z, TAGE[zeitraum], markt)
         st.markdown(bericht(z))
