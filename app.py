@@ -189,7 +189,34 @@ def analysiere(markt, lookback):
     return [analyse(t, n, d[t], lookback) for t, n in liste(markt).items() if t in d]
 
 
-def zeige_chart(z, tage, markt):
+FIB = [0, 0.236, 0.382, 0.5, 0.618, 0.786, 1]
+
+
+def fib_ebenen(d):
+    """Fib-Retracement auf Hoch und Tief des Zeitraums. 0 % = Ende, 100 % = Start der Bewegung."""
+    hoch, tief = float(d["High"].max()), float(d["Low"].min())
+    t_hoch, t_tief = d["High"].idxmax(), d["Low"].idxmin()
+    aufw = t_tief < t_hoch
+    spanne = hoch - tief
+    ebenen = [(r, hoch - r * spanne if aufw else tief + r * spanne) for r in FIB]
+    return aufw, ebenen, ((t_tief, t_hoch) if aufw else (t_hoch, t_tief))
+
+
+def zeige_fib(z, tage, markt):
+    d = daten(markt)[z["Ticker"]].tail(tage)
+    aufw, ebenen, (start, ende) = fib_ebenen(d)
+    kurs = float(d["Close"].iloc[-1])
+    tab = pd.DataFrame({"Ebene": [f"{r * 100:.1f} %" for r, _ in ebenen],
+                        "Kurs": [round(p, 2) for _, p in ebenen],
+                        "Abstand %": [round((p / kurs - 1) * 100, 1) for _, p in ebenen]})
+    naechste = min(ebenen, key=lambda e: abs(e[1] - kurs))
+    richtung = "Aufwärtsbewegung" if aufw else "Abwärtsbewegung"
+    st.caption(f"Fib Retracement auf der {richtung} vom {start:%d.%m.%Y} bis {ende:%d.%m.%Y} "
+               f"(Hoch und Tief im gewählten Zeitraum). Nächstgelegene Ebene: {naechste[0] * 100:.1f} %.")
+    st.dataframe(tab, hide_index=True, width="stretch")
+
+
+def zeige_chart(z, tage, markt, fib=True):
     df = daten(markt)[z["Ticker"]]
     i = indikatoren(df)
     d = df.tail(tage)
@@ -210,6 +237,15 @@ def zeige_chart(z, tage, markt):
                              line=dict(color="#7f7f7f", width=1.4)), row=2, col=1)
     for lvl in (30, 70):
         fig.add_hline(y=lvl, line=dict(dash="dot", width=1, color="#999999"), row=2, col=1)
+    if fib:
+        _, ebenen, _ = fib_ebenen(d)
+        for r, p in ebenen:
+            wichtig = r in (0.382, 0.5, 0.618)
+            fig.add_hline(y=p, row=1, col=1,
+                          line=dict(dash="dot", width=1.2 if wichtig else 0.8,
+                                    color="#d4a017" if wichtig else "#999999"),
+                          annotation_text=f"{r * 100:.1f} %", annotation_position="top right",
+                          annotation_font_size=10)
     fig.update_xaxes(rangebreaks=[dict(bounds=["sat", "mon"])],
                      rangeslider_visible=False, fixedrange=True)
     fig.update_yaxes(fixedrange=True)
@@ -233,20 +269,38 @@ def lade_indizes():
     return out
 
 
+def trend(c):
+    """Bullish: Kurs über EMA200 und EMA5 über EMA20. Bearish: beides darunter. Sonst neutral."""
+    e5 = c.ewm(span=5, adjust=False).mean().iloc[-1]
+    e20 = c.ewm(span=20, adjust=False).mean().iloc[-1]
+    e200 = c.ewm(span=200, adjust=False).mean().iloc[-1]
+    kurs = c.iloc[-1]
+    grund = (f"Kurs {'über' if kurs > e200 else 'unter'} EMA200, "
+             f"EMA5 {'über' if e5 > e20 else 'unter'} EMA20")
+    if kurs > e200 and e5 > e20:
+        return ":green[Bullish]", grund
+    if kurs < e200 and e5 < e20:
+        return ":red[Bearish]", grund
+    return ":orange[Neutral]", grund
+
+
 def zeige_indizes():
     with st.spinner("Lade Indizes ..."):
         idx = lade_indizes()
     if not idx:
         st.warning("Keine Indexdaten geladen. Bitte später erneut versuchen.")
         return
+    st.caption("Trend: Bullish = Kurs über EMA200 und EMA5 über EMA20. "
+               "Bearish = beides darunter. Sonst Neutral. Beschreibung, keine Prognose.")
     for name, c in idx.items():
-        ema = c.ewm(span=200, adjust=False).mean()
         j = c.tail(252)
         wandel = (j.iloc[-1] / j.iloc[0] - 1) * 100
-        lage = "über" if c.iloc[-1] > ema.iloc[-1] else "unter"
         st.subheader(f"{name} Index")
         st.metric("Stand", f"{j.iloc[-1]:,.0f}".replace(",", "."), f"{wandel:+.1f} % in 12 Monaten")
-        st.caption(f"Liegt {lage} der EMA200.")
+        label, grund = trend(c)
+        st.markdown(f"**Trend: {label}**")
+        st.caption(grund + ".")
+        ema = c.ewm(span=200, adjust=False).mean()
         fig = go.Figure()
         fig.add_trace(go.Scatter(x=j.index, y=j, name=name, mode="lines",
                                  line=dict(color="#1f77b4", width=2)))
@@ -257,6 +311,46 @@ def zeige_indizes():
         fig.update_layout(height=240, margin=dict(l=4, r=4, t=8, b=4), dragmode=False,
                           legend=dict(orientation="h", y=1.18, x=0))
         st.plotly_chart(fig, width="stretch", config={"displayModeBar": False}, key=f"idx_{name}")
+
+
+@st.cache_resource(ttl=3600, show_spinner=False)
+def lade_vix():
+    roh = yf.download(["^VIX"], period="2y", interval="1d", auto_adjust=True,
+                      group_by="ticker", threads=True, progress=False)
+    try:
+        return roh["^VIX"]["Close"].dropna()
+    except Exception:
+        return None
+
+
+def zeige_vix():
+    with st.spinner("Lade VIX ..."):
+        c = lade_vix()
+    if c is None or len(c) < 30:
+        st.warning("Keine VIX-Daten geladen. Bitte später erneut versuchen.")
+        return
+    j = c.tail(252)
+    v = float(c.iloc[-1])
+    wandel = (j.iloc[-1] / j.iloc[0] - 1) * 100
+    niveau = "niedrig" if v < 15 else "mittel" if v < 25 else "hoch"
+    fmt = lambda x: f"{float(x):.2f}".replace(".", ",")
+    st.subheader("VIX")
+    st.caption("Angstbarometer zum S&P 500. Steigt bei Unsicherheit. Kein Trendsignal.")
+    st.metric("Stand", fmt(v), f"{wandel:+.1f} % in 12 Monaten")
+    st.markdown(f"**Volatilität: {niveau}**")
+    st.caption("Unter 15 niedrig, 15 bis 25 mittel, über 25 hoch.")
+    links, rechts = st.columns(2)
+    links.metric("Tief (12 Monate)", fmt(j.min()))
+    rechts.metric("Hoch (12 Monate)", fmt(j.max()))
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=j.index, y=j, name="VIX", mode="lines",
+                             line=dict(color="#9467bd", width=2)))
+    for lvl in (15, 25):
+        fig.add_hline(y=lvl, line=dict(dash="dot", width=1, color="#999999"))
+    fig.update_xaxes(rangebreaks=[dict(bounds=["sat", "mon"])], fixedrange=True)
+    fig.update_yaxes(fixedrange=True)
+    fig.update_layout(height=300, margin=dict(l=4, r=4, t=8, b=4), dragmode=False, showlegend=False)
+    st.plotly_chart(fig, width="stretch", config={"displayModeBar": False}, key="vix_chart")
 
 
 def bericht(z):
@@ -293,15 +387,18 @@ lookback = st.slider("Signal-Zeitraum (letzte Tage)", 1, 10, 3)
 min_signale = st.slider("Mindestanzahl Signale", 0, 3, 1)
 
 gewaehlt = None
-if st.button("Index", type="primary", width="stretch", key="btn_Index"):
+kopf = st.columns(2)
+if kopf[0].button("Index", type="primary", width="stretch", key="btn_Index"):
     gewaehlt = "Index"
+if kopf[1].button("VIX", type="primary", width="stretch", key="btn_VIX"):
+    gewaehlt = "VIX"
 plaetze = st.columns(2) + st.columns(2) + st.columns(2)
 for platz, name in zip(plaetze, MARKT_NAMEN):
     if platz.button(f"{name} scannen", type="primary", width="stretch", key=f"btn_{name}"):
         gewaehlt = name
 
-if gewaehlt == "Index":
-    st.session_state["markt"] = "Index"
+if gewaehlt in ("Index", "VIX"):
+    st.session_state["markt"] = gewaehlt
 elif gewaehlt:
     try:
         with st.spinner("Lade Aktienliste ... (beim ersten MDAX- oder SDAX-Scan dauert das etwa eine Minute)"):
@@ -320,6 +417,9 @@ elif gewaehlt:
 markt = st.session_state.get("markt")
 if markt == "Index":
     zeige_indizes()
+    markt = None
+elif markt == "VIX":
+    zeige_vix()
     markt = None
 if markt:
     rows = analysiere(markt, lookback)
@@ -362,5 +462,8 @@ if markt:
         z = treffer.iloc[zeilen[0]].to_dict()
         st.subheader(f"{z['Name']} ({z['Ticker']})")
         zeitraum = st.radio("Zeitraum", list(TAGE), index=1, horizontal=True)
-        zeige_chart(z, TAGE[zeitraum], markt)
+        fib = st.checkbox("Fib Retracement anzeigen", value=True)
+        zeige_chart(z, TAGE[zeitraum], markt, fib)
+        if fib:
+            zeige_fib(z, TAGE[zeitraum], markt)
         st.markdown(bericht(z))
