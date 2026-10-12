@@ -48,7 +48,8 @@ DE_WIKI = {"MDAX": "https://de.wikipedia.org/wiki/MDAX", "SDAX": "https://de.wik
 INDIZES = {"Dow Jones": "^DJI", "DAX": "^GDAXI", "MDAX": "^MDAXI", "SDAX": "^SDAXI",
            "S&P 500": "^GSPC", "Nasdaq-100": "^NDX"}
 MARKT_NAMEN = ["Dow Jones", "DAX", "MDAX", "SDAX", "S&P 500", "Nasdaq-100"]
-SIGNALE = ["RSI schneidet MA", "Kerze schneidet EMA20", "EMA5 schneidet EMA20"]
+SIGNALE = ["Über EMA200", "Aufwärtstrend 3 Monate", "RSI schneidet MA",
+           "Kerze schneidet EMA20", "EMA5 schneidet EMA20"]
 ANZEIGE = ["Name", "Ticker", "Kurs", "Abstand EMA200 %", "Signale"]
 TAGE = {"3 Monate": 63, "6 Monate": 126, "1 Jahr": 252}
 BLOCK = 50  # Aktien pro Download-Paket
@@ -173,7 +174,8 @@ def analyse(ticker, name, df, lookback):
     return {
         "Name": name, "Ticker": ticker,
         "Kurs": round(float(c.iloc[-1]), 2),
-        "Ueber EMA200": bool(c.iloc[-1] > i["ema200"].iloc[-1]),
+        "Über EMA200": bool(c.iloc[-1] > i["ema200"].iloc[-1]),
+        "Aufwärtstrend 3 Monate": aufwaertstrend(df),
         "Abstand EMA200 %": round(float((c.iloc[-1] / i["ema200"].iloc[-1] - 1) * 100), 1),
         "RSI schneidet MA": cross_up(i["r"], i["r_ma"], lookback),
         "Kerze schneidet EMA20": cross_up(c, i["ema20"], lookback),
@@ -360,6 +362,14 @@ def swings(df, n):
     return out
 
 
+def aufwaertstrend(df, tage=63, n=5):
+    """Aufwärtstrend der letzten 3 Monate (63 Handelstage): höhere Hochs und höhere Tiefs."""
+    pts = [p for p in swings(df, n) if p[0] >= df.index[-tage]]
+    hs = [p[1] for p in pts if p[2] == "H"]
+    ts = [p[1] for p in pts if p[2] == "T"]
+    return len(hs) >= 2 and len(ts) >= 2 and hs[-1] > hs[-2] and ts[-1] > ts[-2]
+
+
 def zeige_swings(z, tage, markt, n):
     df = daten(markt)[z["Ticker"]]
     d = df.tail(tage)
@@ -474,21 +484,22 @@ def zeige_vola(name):
 
 def bericht(z):
     aktiv = [k for k in SIGNALE if z[k]]
+    fehlen = [k for k in SIGNALE if not z[k]]
     n = len(aktiv)
-    szen = "bullisch" if n >= 2 else "neutral" if n == 1 else "abwartend"
+    szen = "bullisch" if n >= 4 else "neutral" if n >= 2 else "abwartend"
     setup = "Pullback/Trendfortsetzung" if z["Kerze schneidet EMA20"] else "Trend ohne frischen Einstieg"
     return f"""**1. Kontext**
-Trend über EMA200 ({z['Abstand EMA200 %']} %), Volatilität {z['Volatilitaet 20T %']} % (20 Tage), RSI {z['RSI']}.
+Abstand zur EMA200 {z['Abstand EMA200 %']} %, Volatilität {z['Volatilitaet 20T %']} % (20 Tage), RSI {z['RSI']}.
 Setup-Idee: {setup}.
-Aktive Signale: {', '.join(aktiv) if aktiv else 'keine'}.
-Pro: Kurs über EMA200, {n} von 3 Signalen aktiv.
-Contra: MA Rush und LIQ Setup sind hier **nicht** geprüft.
+Aktive Signale ({n} von 5): {', '.join(aktiv) if aktiv else 'keine'}.
+Pro: {n} von 5 Signalen aktiv.
+Contra: nicht aktiv: {', '.join(fehlen) if fehlen else 'keine'}. MA Rush und LIQ Setup sind hier **nicht** geprüft.
 Risiko: Stop-Lage und Positionsgröße selbst festlegen.
 
 **2. Wenn-Dann-Regeln**
-- Wenn mind. 2 Signale aktiv UND MA Rush bullish UND LIQ Long Break, dann Setup prüfen.
+- Wenn mind. 4 von 5 Signalen aktiv sind UND MA Rush bullish UND LIQ Long Break, dann Setup prüfen.
 - Wenn der Kurs unter die EMA200 schließt, dann Long-Idee verwerfen.
-- Wenn nur 1 Signal aktiv ist, dann beobachten, nicht handeln.
+- Wenn weniger als 3 Signale aktiv sind, dann beobachten, nicht handeln.
 
 **3. Szenario heute:** {szen}
 
@@ -503,7 +514,7 @@ st.title("Aktien-Scanner")
 st.caption("Long-Setups über EMA200. Keine Finanzberatung, keine Prognose.")
 
 lookback = st.slider("Signal-Zeitraum (letzte Tage)", 1, 10, 3)
-min_signale = st.slider("Mindestanzahl Signale", 0, 3, 1)
+min_signale = st.slider("Mindestanzahl Signale (von 5)", 0, 5, 3)
 
 gewaehlt = None
 kopf = st.columns(2)
@@ -553,12 +564,12 @@ if markt:
     fehlt = [t for t in liste(markt) if t not in gefunden]
     tab = pd.DataFrame(rows)
     tab["Signale"] = tab[SIGNALE].sum(axis=1)
-    treffer = tab[tab["Ueber EMA200"] & (tab["Signale"] >= min_signale)]
+    treffer = tab[tab["Signale"] >= min_signale]
     treffer = treffer.sort_values(["Signale", "Abstand EMA200 %"],
                                   ascending=[False, False]).reset_index(drop=True)
 
     st.subheader(f"{markt}: {len(treffer)} Treffer "
-                 f"({int(tab['Ueber EMA200'].sum())} von {len(tab)} über EMA200)")
+                 f"({int(tab['Über EMA200'].sum())} von {len(tab)} über EMA200)")
     if fehlt:
         st.caption(f"Keine Daten für {len(fehlt)} Werte, zum Beispiel: " + ", ".join(fehlt[:8]))
     if markt in DE_WIKI and index_laden(markt)[1]:
