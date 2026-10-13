@@ -48,8 +48,8 @@ DE_WIKI = {"MDAX": "https://de.wikipedia.org/wiki/MDAX", "SDAX": "https://de.wik
 INDIZES = {"Dow Jones": "^DJI", "DAX": "^GDAXI", "MDAX": "^MDAXI", "SDAX": "^SDAXI",
            "S&P 500": "^GSPC", "Nasdaq-100": "^NDX"}
 MARKT_NAMEN = ["Dow Jones", "DAX", "MDAX", "SDAX", "S&P 500", "Nasdaq-100"]
-SIGNALE = ["Über EMA200", "Aufwärtstrend 3 Monate", "RSI schneidet MA",
-           "Kerze schneidet EMA20", "EMA5 schneidet EMA20"]
+SIGNALE = ["Über EMA200", "Aufwärtstrend 3 Monate", "3 Zyklen höhere Hochs/Tiefs",
+           "RSI schneidet MA", "Kerze schneidet EMA20", "EMA5 schneidet EMA20"]
 ANZEIGE = ["Name", "Ticker", "Kurs", "Abstand EMA200 %", "Signale"]
 TAGE = {"3 Monate": 63, "6 Monate": 126, "1 Jahr": 252}
 BLOCK = 50  # Aktien pro Download-Paket
@@ -186,6 +186,7 @@ def analyse(ticker, name, df, lookback):
         "Kurs": round(float(c.iloc[-1]), 2),
         "Über EMA200": bool(c.iloc[-1] > i["ema200"].iloc[-1]),
         "Aufwärtstrend 3 Monate": aufwaertstrend(df),
+        "3 Zyklen höhere Hochs/Tiefs": hoehere_swings(df),
         "Abstand EMA200 %": round(float((c.iloc[-1] / i["ema200"].iloc[-1] - 1) * 100), 1),
         "RSI schneidet MA": cross_up(i["r"], i["r_ma"], lookback),
         "Kerze schneidet EMA20": cross_up(c, i["ema20"], lookback),
@@ -386,6 +387,15 @@ def aufwaertstrend(df, tage=63, n=5):
     return len(hs) >= 2 and len(ts) >= 2 and hs[-1] > hs[-2] and ts[-1] > ts[-2]
 
 
+def hoehere_swings(df, zyklen=3, n=5):
+    """Die letzten 3 Swing-Hochs und die letzten 3 Swing-Tiefs liegen jeweils immer höher als die davor."""
+    pts = swings(df, n)
+    hs = [p[1] for p in pts if p[2] == "H"][-zyklen:]
+    ts = [p[1] for p in pts if p[2] == "T"][-zyklen:]
+    return (len(hs) == zyklen and len(ts) == zyklen
+            and all(b > a for a, b in zip(hs, hs[1:])) and all(b > a for a, b in zip(ts, ts[1:])))
+
+
 def zeige_swings(z, tage, markt, n):
     df = kurse(markt, z["Ticker"])
     d = df.tail(tage)
@@ -434,7 +444,9 @@ def zeige_swings(z, tage, markt, n):
         else:
             struktur = f"{'höheres' if hh else 'tieferes'} Hoch, {'höheres' if hl else 'tieferes'} Tief"
         text += f" Struktur: {struktur}."
-    st.caption(text + f" Ein Swing gilt erst {n} Kerzen nach dem Extrem als bestätigt.")
+    drei = "aktiv" if hoehere_swings(df) else "nicht aktiv"
+    st.caption(text + f" Ein Swing gilt erst {n} Kerzen nach dem Extrem als bestätigt. "
+                      f"Signal \"3 Zyklen höhere Hochs/Tiefs\" (Swing-Stärke 5): {drei}.")
 
 
 VOLA = {
@@ -502,18 +514,18 @@ def bericht(z):
     aktiv = [k for k in SIGNALE if z[k]]
     fehlen = [k for k in SIGNALE if not z[k]]
     n = len(aktiv)
-    szen = "bullisch" if n >= 4 else "neutral" if n >= 2 else "abwartend"
+    szen = "bullisch" if n >= len(SIGNALE) - 1 else "neutral" if n >= 2 else "abwartend"
     setup = "Pullback/Trendfortsetzung" if z["Kerze schneidet EMA20"] else "Trend ohne frischen Einstieg"
     return f"""**1. Kontext**
 Abstand zur EMA200 {z['Abstand EMA200 %']} %, Volatilität {z['Volatilitaet 20T %']} % (20 Tage), RSI {z['RSI']}.
 Setup-Idee: {setup}.
-Aktive Signale ({n} von 5): {', '.join(aktiv) if aktiv else 'keine'}.
-Pro: {n} von 5 Signalen aktiv.
+Aktive Signale ({n} von {len(SIGNALE)}): {', '.join(aktiv) if aktiv else 'keine'}.
+Pro: {n} von {len(SIGNALE)} Signalen aktiv.
 Contra: nicht aktiv: {', '.join(fehlen) if fehlen else 'keine'}. MA Rush und LIQ Setup sind hier **nicht** geprüft.
 Risiko: Stop-Lage und Positionsgröße selbst festlegen.
 
 **2. Wenn-Dann-Regeln**
-- Wenn mind. 4 von 5 Signalen aktiv sind UND MA Rush bullish UND LIQ Long Break, dann Setup prüfen.
+- Wenn mind. {len(SIGNALE) - 1} von {len(SIGNALE)} Signalen aktiv sind UND MA Rush bullish UND LIQ Long Break, dann Setup prüfen.
 - Wenn der Kurs unter die EMA200 schließt, dann Long-Idee verwerfen.
 - Wenn weniger als 3 Signale aktiv sind, dann beobachten, nicht handeln.
 
@@ -530,7 +542,7 @@ st.title("Aktien-Scanner")
 st.caption("Long-Setups über EMA200. Keine Finanzberatung, keine Prognose.")
 
 lookback = st.slider("Signal-Zeitraum (letzte Tage)", 1, 10, 3)
-min_signale = st.slider("Mindestanzahl Signale (von 5)", 0, 5, 3)
+min_signale = st.slider(f"Mindestanzahl Signale (von {len(SIGNALE)})", 0, len(SIGNALE), 3)
 
 gewaehlt = None
 kopf = st.columns(2)
