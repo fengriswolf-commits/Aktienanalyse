@@ -159,6 +159,16 @@ def daten(markt):
     return d
 
 
+def kurse(markt, ticker):
+    """Kursdaten einer Aktie. Fehlen sie (Cache abgelaufen, Yahoo antwortet nicht), kommt ein Hinweis statt eines Fehlers."""
+    df = daten(markt).get(ticker)
+    if df is None:
+        st.warning(f"Für {ticker} liegen gerade keine Kursdaten vor, Yahoo hat nicht geantwortet. "
+                   "Bitte den Scan erneut starten.")
+        st.stop()
+    return df
+
+
 def indikatoren(df):
     c = df["Close"]
     r = rsi(c)
@@ -186,9 +196,15 @@ def analyse(ticker, name, df, lookback):
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def analysiere(markt, lookback):
+def _analysiere(markt, lookback, token):
     d = daten(markt)
     return [analyse(t, n, d[t], lookback) for t, n in liste(markt).items() if t in d]
+
+
+def analysiere(markt, lookback):
+    # Token ändert sich, wenn die Kursdaten neu geladen wurden. Dann wird auch neu gerechnet.
+    token = tuple(id(lade_block(b)) for b in bloecke(markt))
+    return _analysiere(markt, lookback, token)
 
 
 FIB = [0, 0.236, 0.382, 0.5, 0.618, 0.786, 1]
@@ -202,7 +218,7 @@ def fib_ebenen(d):
 
 
 def zeige_fib(z, tage, markt):
-    d = daten(markt)[z["Ticker"]].tail(tage)
+    d = kurse(markt, z["Ticker"]).tail(tage)
     ebenen, t_hoch, t_tief = fib_ebenen(d)
     hoch, tief = ebenen[0][1], ebenen[-1][1]
     kurs = float(d["Close"].iloc[-1])
@@ -224,7 +240,7 @@ def kreuze(a, b):
 
 
 def zeige_chart(z, tage, markt, fib=True, signale=True):
-    df = daten(markt)[z["Ticker"]]
+    df = kurse(markt, z["Ticker"])
     i = indikatoren(df)
     d = df.tail(tage)
     x = d.index
@@ -371,7 +387,7 @@ def aufwaertstrend(df, tage=63, n=5):
 
 
 def zeige_swings(z, tage, markt, n):
-    df = daten(markt)[z["Ticker"]]
+    df = kurse(markt, z["Ticker"])
     d = df.tail(tage)
     pts = [p for p in swings(df, n) if p[0] >= d.index[0]]
     hs = [p for p in pts if p[2] == "H"]
@@ -582,7 +598,7 @@ if markt:
     st.caption("Tippe auf eine Zeile, um den Chart zu sehen.")
     ereignis = st.dataframe(treffer[ANZEIGE], hide_index=True, width="stretch",
                             on_select="rerun", selection_mode="single-row",
-                            key=f"tab_{markt}_{st.session_state.get('scan_nr', 0)}")
+                            key=f"tab_{markt}_{st.session_state.get('scan_nr', 0)}_{lookback}_{min_signale}")
 
     buf = io.BytesIO()
     treffer.to_excel(buf, index=False)
@@ -592,7 +608,7 @@ if markt:
                        width="stretch")
 
     zeilen = ereignis.selection.rows
-    if zeilen:
+    if zeilen and zeilen[0] < len(treffer):
         z = treffer.iloc[zeilen[0]].to_dict()
         st.subheader(f"{z['Name']} ({z['Ticker']})")
         zeitraum = st.radio("Zeitraum", list(TAGE), index=1, horizontal=True)
