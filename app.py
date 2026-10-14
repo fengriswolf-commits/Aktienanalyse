@@ -178,15 +178,15 @@ def indikatoren(df):
             "r": r, "r_ma": r.rolling(14).mean()}
 
 
-def analyse(ticker, name, df, lookback):
+def analyse(ticker, name, df, lookback, swing_n):
     i = indikatoren(df)
     c = i["c"]
     return {
         "Name": name, "Ticker": ticker,
         "Kurs": round(float(c.iloc[-1]), 2),
         "Über EMA200": bool(c.iloc[-1] > i["ema200"].iloc[-1]),
-        "Aufwärtstrend 3 Monate": aufwaertstrend(df),
-        "3 Zyklen höhere Hochs/Tiefs": hoehere_swings(df),
+        "Aufwärtstrend 3 Monate": aufwaertstrend(df, n=swing_n),
+        "3 Zyklen höhere Hochs/Tiefs": hoehere_swings(df, n=swing_n),
         "Abstand EMA200 %": round(float((c.iloc[-1] / i["ema200"].iloc[-1] - 1) * 100), 1),
         "RSI schneidet MA": cross_up(i["r"], i["r_ma"], lookback),
         "Kerze schneidet EMA20": cross_up(c, i["ema20"], lookback),
@@ -197,15 +197,15 @@ def analyse(ticker, name, df, lookback):
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def _analysiere(markt, lookback, token):
+def _analysiere(markt, lookback, swing_n, token):
     d = daten(markt)
-    return [analyse(t, n, d[t], lookback) for t, n in liste(markt).items() if t in d]
+    return [analyse(t, n, d[t], lookback, swing_n) for t, n in liste(markt).items() if t in d]
 
 
-def analysiere(markt, lookback):
+def analysiere(markt, lookback, swing_n):
     # Token ändert sich, wenn die Kursdaten neu geladen wurden. Dann wird auch neu gerechnet.
     token = tuple(id(lade_block(b)) for b in bloecke(markt))
-    return _analysiere(markt, lookback, token)
+    return _analysiere(markt, lookback, swing_n, token)
 
 
 FIB = [0, 0.236, 0.382, 0.5, 0.618, 0.786, 1]
@@ -240,7 +240,7 @@ def kreuze(a, b):
     return (diff.shift(1) <= 0) & (diff > 0)
 
 
-def zeige_chart(z, tage, markt, fib=True, signale=True):
+def zeige_chart(z, tage, markt, fib=True, signale=True, swing_n=5):
     df = kurse(markt, z["Ticker"])
     i = indikatoren(df)
     d = df.tail(tage)
@@ -283,6 +283,16 @@ def zeige_chart(z, tage, markt, fib=True, signale=True):
             x=x[k_rsi], y=s("r")[k_rsi], mode="markers", name="RSI kreuzt MA",
             marker=dict(symbol="triangle-up", size=10, color="#7e57c2", line=dict(color=schwarz, width=1))),
             row=2, col=1)
+
+    if signale and hoehere_swings(df, 3, swing_n):
+        hs, ts = letzte_swings(df, 3, swing_n)
+        for punkte, oben, farbe, name in ((hs, True, "#22d422", "3 höhere Hochs"),
+                                          (ts, False, "#e5252a", "3 höhere Tiefs")):
+            sichtbar = [(t, p) for t, p in punkte if t >= x[0]]
+            if sichtbar:
+                xs, ys = striche(df, sichtbar, oben)
+                fig.add_trace(go.Scatter(x=xs, y=ys, mode="lines", name=name, hoverinfo="skip",
+                                         line=dict(color=farbe, width=6)), row=1, col=1)
 
     if fib:
         ebenen, _, _ = fib_ebenen(d)
@@ -387,24 +397,43 @@ def aufwaertstrend(df, tage=63, n=5):
     return len(hs) >= 2 and len(ts) >= 2 and hs[-1] > hs[-2] and ts[-1] > ts[-2]
 
 
+def letzte_swings(df, zyklen=3, n=5):
+    """Die letzten 3 Swing-Hochs und Swing-Tiefs als Liste von (Datum, Kurs)."""
+    pts = swings(df, n)
+    hs = [(p[0], p[1]) for p in pts if p[2] == "H"][-zyklen:]
+    ts = [(p[0], p[1]) for p in pts if p[2] == "T"][-zyklen:]
+    return hs, ts
+
+
 def hoehere_swings(df, zyklen=3, n=5):
     """Die letzten 3 Swing-Hochs und die letzten 3 Swing-Tiefs liegen jeweils immer höher als die davor."""
-    pts = swings(df, n)
-    hs = [p[1] for p in pts if p[2] == "H"][-zyklen:]
-    ts = [p[1] for p in pts if p[2] == "T"][-zyklen:]
-    return (len(hs) == zyklen and len(ts) == zyklen
-            and all(b > a for a, b in zip(hs, hs[1:])) and all(b > a for a, b in zip(ts, ts[1:])))
+    hs, ts = letzte_swings(df, zyklen, n)
+    hp, tp = [p for _, p in hs], [p for _, p in ts]
+    return (len(hp) == zyklen and len(tp) == zyklen
+            and all(b > a for a, b in zip(hp, hp[1:])) and all(b > a for a, b in zip(tp, tp[1:])))
+
+
+def striche(df, punkte, oben):
+    """Kurze waagerechte Striche über den Hochs (oben) oder unter den Tiefs, wie in der Vorlage."""
+    xs, ys = [], []
+    for t, p in punkte:
+        i = df.index.get_loc(t)
+        x0, x1 = df.index[max(i - 1, 0)], df.index[min(i + 1, len(df) - 1)]
+        y = p * (1.012 if oben else 0.988)
+        xs += [x0, x1, None]
+        ys += [y, y, None]
+    return xs, ys
 
 
 def zeige_swings(z, tage, markt, n):
     df = kurse(markt, z["Ticker"])
-    d = df.tail(tage)
-    pts = [p for p in swings(df, n) if p[0] >= d.index[0]]
-    hs = [p for p in pts if p[2] == "H"]
-    ts = [p for p in pts if p[2] == "T"]
-    if not hs or not ts:
-        st.info("Im gewählten Zeitraum gibt es zu wenige Swings. Wähle eine kleinere Swing-Stärke.")
+    hs, ts = letzte_swings(df, 3, n)
+    if len(hs) < 3 or len(ts) < 3:
+        st.info("Es gibt noch keine 3 Swing-Hochs und 3 Swing-Tiefs. Wähle eine kleinere Swing-Stärke.")
         return
+    aktiv = hoehere_swings(df, 3, n)
+    start = min(df.tail(tage).index[0], hs[0][0], ts[0][0])
+    d = df.loc[start:]
     schwarz = "#1c1c1c"
     fig = go.Figure()
     fig.add_trace(go.Candlestick(
@@ -412,41 +441,24 @@ def zeige_swings(z, tage, markt, n):
         increasing=dict(fillcolor="#3ddc6e", line=dict(color=schwarz, width=1)),
         decreasing=dict(fillcolor="#ef5350", line=dict(color=schwarz, width=1)),
         name="Kurs", showlegend=False))
-    fig.add_trace(go.Scatter(x=[p[0] for p in pts], y=[p[1] for p in pts], mode="lines",
-                             line=dict(color="#6b7a90", width=1.2), name="Swing-Verlauf"))
-    fig.add_trace(go.Scatter(x=[p[0] for p in hs], y=[p[1] * 1.012 for p in hs], mode="markers",
-                             name="Swing-Hoch", marker=dict(symbol="triangle-down", size=11,
-                             color="#d62728", line=dict(color=schwarz, width=1))))
-    fig.add_trace(go.Scatter(x=[p[0] for p in ts], y=[p[1] * 0.988 for p in ts], mode="markers",
-                             name="Swing-Tief", marker=dict(symbol="triangle-up", size=11,
-                             color="#1b9e3f", line=dict(color=schwarz, width=1))))
-    fig.add_hline(y=hs[-1][1], line=dict(dash="dash", width=1, color="#d62728"),
-                  annotation_text=f"Letztes Hoch {hs[-1][1]:.2f}", annotation_position="top left",
-                  annotation_font_size=10)
-    fig.add_hline(y=ts[-1][1], line=dict(dash="dash", width=1, color="#1b9e3f"),
-                  annotation_text=f"Letztes Tief {ts[-1][1]:.2f}", annotation_position="bottom left",
-                  annotation_font_size=10)
+    fig.add_trace(go.Scatter(x=d.index, y=indikatoren(df)["ema200"].reindex(d.index), mode="lines",
+                             name="EMA200", line=dict(color="#ff9f1c", width=2)))
+    for punkte, oben, farbe, name in ((hs, True, "#22d422", "Letzte 3 Swing-Hochs"),
+                                      (ts, False, "#e5252a", "Letzte 3 Swing-Tiefs")):
+        xs, ys = striche(df, punkte, oben)
+        fig.add_trace(go.Scatter(x=xs, y=ys, mode="lines", name=name, hoverinfo="skip",
+                                 line=dict(color=farbe, width=6)))
     fig.update_xaxes(rangebreaks=[dict(bounds=["sat", "mon"])], rangeslider_visible=False,
                      fixedrange=True, showgrid=False)
     fig.update_yaxes(fixedrange=True, side="right", gridcolor="#dbe5f3")
-    fig.update_layout(height=420, margin=dict(l=4, r=4, t=36, b=4), dragmode=False,
+    fig.update_layout(height=440, margin=dict(l=4, r=4, t=36, b=4), dragmode=False,
                       paper_bgcolor="#eef4fc", plot_bgcolor="#eef4fc", font=dict(color=schwarz),
                       legend=dict(orientation="h", y=1.1, x=0, font=dict(size=10)))
     st.plotly_chart(fig, theme=None, width="stretch", config={"displayModeBar": False},
                     key="swing_chart")
-    text = f"Letztes Hoch: {hs[-1][1]:.2f} am {hs[-1][0]:%d.%m.%Y}. Letztes Tief: {ts[-1][1]:.2f} am {ts[-1][0]:%d.%m.%Y}."
-    if len(hs) >= 2 and len(ts) >= 2:
-        hh, hl = hs[-1][1] > hs[-2][1], ts[-1][1] > ts[-2][1]
-        if hh and hl:
-            struktur = "höhere Hochs und höhere Tiefs"
-        elif not hh and not hl:
-            struktur = "tiefere Hochs und tiefere Tiefs"
-        else:
-            struktur = f"{'höheres' if hh else 'tieferes'} Hoch, {'höheres' if hl else 'tieferes'} Tief"
-        text += f" Struktur: {struktur}."
-    drei = "aktiv" if hoehere_swings(df) else "nicht aktiv"
-    st.caption(text + f" Ein Swing gilt erst {n} Kerzen nach dem Extrem als bestätigt. "
-                      f"Signal \"3 Zyklen höhere Hochs/Tiefs\" (Swing-Stärke 5): {drei}.")
+    kette = lambda punkte: " → ".join(f"{p:.2f}" for _, p in punkte)
+    st.caption(f"Signal \"3 Zyklen höhere Hochs/Tiefs\": {'aktiv' if aktiv else 'nicht aktiv'}. "
+               f"Hochs: {kette(hs)}. Tiefs: {kette(ts)}. Swing-Stärke {n}.")
 
 
 VOLA = {
@@ -543,6 +555,7 @@ st.caption("Long-Setups über EMA200. Keine Finanzberatung, keine Prognose.")
 
 lookback = st.slider("Signal-Zeitraum (letzte Tage)", 1, 10, 3)
 min_signale = st.slider(f"Mindestanzahl Signale (von {len(SIGNALE)})", 0, len(SIGNALE), 3)
+swing_n = st.slider("Swing-Stärke (Kerzen links und rechts)", 2, 10, 5)
 
 gewaehlt = None
 kopf = st.columns(2)
@@ -584,7 +597,7 @@ elif markt in VOLA:
     zeige_vola(markt)
     markt = None
 if markt:
-    rows = analysiere(markt, lookback)
+    rows = analysiere(markt, lookback, swing_n)
     if not rows:
         st.warning("Keine Daten geladen. Bitte später erneut versuchen.")
         st.stop()
@@ -610,7 +623,7 @@ if markt:
     st.caption("Tippe auf eine Zeile, um den Chart zu sehen.")
     ereignis = st.dataframe(treffer[ANZEIGE], hide_index=True, width="stretch",
                             on_select="rerun", selection_mode="single-row",
-                            key=f"tab_{markt}_{st.session_state.get('scan_nr', 0)}_{lookback}_{min_signale}")
+                            key=f"tab_{markt}_{st.session_state.get('scan_nr', 0)}_{lookback}_{min_signale}_{swing_n}")
 
     buf = io.BytesIO()
     treffer.to_excel(buf, index=False)
@@ -627,10 +640,9 @@ if markt:
         links, rechts = st.columns(2)
         signale = links.checkbox("Signale markieren", value=True)
         fib = rechts.checkbox("Fib Retracement anzeigen", value=True)
-        zeige_chart(z, TAGE[zeitraum], markt, fib, signale)
+        zeige_chart(z, TAGE[zeitraum], markt, fib, signale, swing_n)
         if fib:
             zeige_fib(z, TAGE[zeitraum], markt)
-        st.markdown("**Letzte Hochs und Tiefs**")
-        n_swing = st.slider("Swing-Stärke (Kerzen links und rechts)", 2, 10, 5)
-        zeige_swings(z, TAGE[zeitraum], markt, n_swing)
+        st.markdown("**Letzte Hochs und Tiefs (Signal 3)**")
+        zeige_swings(z, TAGE[zeitraum], markt, swing_n)
         st.markdown(bericht(z))
